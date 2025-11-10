@@ -28,6 +28,7 @@ class ActorCritic(nn.Module):
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
         num_costs: int = 0,
+        predict_failure_prob: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -37,6 +38,7 @@ class ActorCritic(nn.Module):
             )
         super().__init__()
         self.num_costs = int(num_costs)
+        self.predict_failure_prob = predict_failure_prob
         # get the observation dimensions
         self.obs_groups = obs_groups
         num_actor_obs = 0
@@ -66,6 +68,11 @@ class ActorCritic(nn.Module):
 
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
+        # predict failure probability critic
+        self.critic_fail = None
+        if self.predict_failure_prob:
+            self.critic_fail = MLP(num_actor_obs, 1, critic_hidden_dims, activation)
+            print(f"Fail Critic MLP (using actor obs): {self.critic_fail}")
         if critic_obs_normalization:
             self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
         else:
@@ -139,10 +146,19 @@ class ActorCritic(nn.Module):
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         return self.critic_c(obs)  # [B,m]
+    #predict failure probability
+    def evaluate_fail(self, obs, **kwargs):
+        if not self.predict_failure_prob:
+            return None # <--- MODIFIED: 返回 Non
+        obs = self.get_actor_obs(obs)
+        obs = self.actor_obs_normalizer(obs)
+        return self.critic_fail(obs)
+    
     def evaluate_values(self, obs, **kwargs):
         v_r = self.evaluate(obs, **kwargs)         # [B,1]
         v_c = self.evaluate_costs(obs, **kwargs)   # [B,m] or [B,0]
-        return v_r, v_c
+        v_f = self.evaluate_fail(obs, **kwargs)
+        return v_r, v_c, v_f
     def get_actor_obs(self, obs):
         obs_list = []
         for obs_group in self.obs_groups["policy"]:
