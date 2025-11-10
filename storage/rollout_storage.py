@@ -22,13 +22,17 @@ class RolloutStorage:
             self.values_r = None      # [N,1]
             # cost values
             self.values_c = None      # [N,m]
+            # failure probability values
+            self.values_fail = None      # [N,1]
 
             self.actions_log_prob = None
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
-
+            # cost signals
             self.costs = None         # [N,m]
+            # failure probability signals
+            self.costs_fail = None
 
         def clear(self):
             self.__init__()
@@ -42,6 +46,7 @@ class RolloutStorage:
         actions_shape,
         device="cpu",
         num_costs: int = 0,
+        predict_failure_prob: bool = False,
     ):
         # store inputs
         self.training_type = training_type
@@ -50,7 +55,7 @@ class RolloutStorage:
         self.num_envs = num_envs
         self.actions_shape = actions_shape
         self.num_costs = int(num_costs)
-
+        self.predict_failure_prob = predict_failure_prob
         # Core
         self.observations = TensorDict(
             {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
@@ -73,11 +78,18 @@ class RolloutStorage:
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns_r  = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages_r  = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            #for cost values
             if self.num_costs > 0:
                 self.values_c = torch.zeros(num_transitions_per_env, num_envs, self.num_costs, device=device)
                 self.costs = torch.zeros(num_transitions_per_env, num_envs, self.num_costs, device=device)
                 self.returns_c = torch.zeros(num_transitions_per_env, num_envs, self.num_costs, device=device)
                 self.advantages_c = torch.zeros(num_transitions_per_env, num_envs, self.num_costs, device=device)
+            #for failure probability values
+            if self.predict_failure_prob:
+                self.values_fail = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
+                self.costs_fail = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
+                self.returns_fail = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
+                self.advantages_fail = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
         # For RNN networks
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
@@ -109,6 +121,9 @@ class RolloutStorage:
             if self.num_costs > 0 and transition.values_c is not None:
                 self.values_c[self.step].copy_(transition.values_c)
                 self.costs[self.step].copy_(transition.costs)
+            if self.predict_failure_prob and transition.values_fail is not None:
+                self.values_fail[self.step].copy_(transition.values_fail)
+                self.costs_fail[self.step].copy_(transition.costs_fail)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -141,7 +156,10 @@ class RolloutStorage:
     def compute_returns(self, last_values_r, gamma, lam, normalize_advantage: bool = True,
         last_values_c=None,
         gamma_cost=None,
-        lam_cost=None,):
+        lam_cost=None,
+        last_values_fail=None,
+        gamma_cost_fail=None,
+        lam_cost_fail=None,):
         advantage_r  = 0
         for step in reversed(range(self.num_transitions_per_env)):
             # if we are at the last step, bootstrap the return value
@@ -183,7 +201,20 @@ class RolloutStorage:
                 mean = self.advantages_c.mean(dim=(0, 1), keepdim=True)
                 std = self.advantages_c.std(dim=(0, 1), keepdim=True)
                 self.advantages_c = (self.advantages_c - mean) / (std + 1e-8)
+        if last_values_fail is not None and self.predict_failure_prob:
+            gc_f = gamma_cost_fail if gamma_cost_fail is not None else gamma
+            lc_f = lam_cost_fail if lam_cost_fail is not None else lam
+            advantage_f = torch.zeros_like(self.costs_fail[0])  # [N, 1]
+            
+            for step in reversed(range(self.num_transitions_per_env)):
+                next_vf = last_values_fail if step == self.num_transitions_per_env - 1 else self.values_fail[step + 1]
+                next_nonterm = (1.0 - self.dones[step].float())
+                
+                delta_f = self.costs_fail[step] + next_nonterm * gc_f * next_vf - self.values_fail[step]
+                advantage_f = delta_f + next_nonterm * gc_f * lc_f * advantage_f
+                self.returns_fail[step] = advantage_f + self.values_fail[step]
 
+            self.advantages_fail = self.returns_fail - self.values_fail
     # for distillation
     def generator(self):
         if self.training_type != "distillation":
@@ -215,6 +246,10 @@ class RolloutStorage:
             values_c = self.values_c.flatten(0, 1)
             returns_c = self.returns_c.flatten(0, 1)
             advantages_c = self.advantages_c.flatten(0, 1)
+        if self.predict_failure_prob:
+            values_fail = self.values_fail.flatten(0, 1)
+            returns_fail = self.returns_fail.flatten(0, 1)
+            advantages_fail = self.advantages_fail.flatten(0, 1)
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
@@ -242,11 +277,20 @@ class RolloutStorage:
                     target_values_c_batch = None
                     returns_c_batch = None
                     advantages_c_batch = None
+                if self.predict_failure_prob:
+                    target_values_fail_batch = values_fail[batch_idx]
+                    returns_fail_batch = returns_fail[batch_idx]
+                    advantages_fail_batch = advantages_fail[batch_idx]
+                else:
+                    target_values_fail_batch = None
+                    returns_fail_batch = None
+                    advantages_fail_batch = None
                 # yield the mini-batch
                 yield obs_batch, actions_batch, target_values_batch, advantages_r_batch, returns_r_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None,target_values_c_batch, advantages_c_batch, returns_c_batch
+                ), None,target_values_c_batch, advantages_c_batch, returns_c_batch,\
+                    target_values_fail_batch, advantages_fail_batch, returns_fail_batch
 
     # for reinfrocement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

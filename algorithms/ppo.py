@@ -45,6 +45,9 @@ class PPO:
         kappa: float = 20.0,
         gamma_cost: float | None = None,
         gae_lambda_cost: float | None = None,
+        predict_failure_prob: bool = False,
+        gamma_cost_fail: float | None = None,
+        gae_lambda_cost_fail: float | None = None,
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
@@ -124,6 +127,10 @@ class PPO:
         self.gamma_cost = gamma if gamma_cost is None else float(gamma_cost)
         self.lam_cost = lam if gae_lambda_cost is None else float(gae_lambda_cost)
         self.cost_limits = None if cost_limits is None else torch.tensor(cost_limits, device=device).view(1, -1)
+        self.predict_failure_prob = predict_failure_prob
+        self.gamma_cost_fail = 1.0 if gamma_cost_fail is None else float(gamma_cost_fail)
+        self.lam_cost_fail = 1.0 if gae_lambda_cost_fail is None else float(gae_lambda_cost_fail)
+
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         # create rollout storage
         self.storage = RolloutStorage(
@@ -134,6 +141,7 @@ class PPO:
             actions_shape,
             self.device,
             num_costs=self.num_costs,
+            predict_failure_prob=self.predict_failure_prob,
         )
 
     def act(self, obs):
@@ -143,8 +151,10 @@ class PPO:
         self.transition.actions = self.policy.act(obs).detach()
         v_r = self.policy.evaluate(obs).detach()
         v_c = self.policy.evaluate_costs(obs).detach() if self.num_costs > 0 else None
+        v_f = self.policy.evaluate_fail(obs).detach() if self.predict_failure_prob else None
         self.transition.values_r = v_r
         self.transition.values_c = v_c
+        self.transition.values_fail = v_f
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -175,10 +185,16 @@ class PPO:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values_r * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
+        # cost signals
         if self.num_costs:
             if "costs" not in extras:
                 raise KeyError("P3O expects extras['costs'] of shape [num_envs, num_costs].")
             self.transition.costs = extras["costs"].to(self.device)
+        # failure probability signals
+        if self.predict_failure_prob:
+            if "fail" not in extras:
+                raise KeyError("PPO expects extras['fail'] when predict_failure_prob=True.")
+            self.transition.costs_fail = extras["fail"].to(self.device).view(-1, 1)
         # record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
@@ -188,7 +204,7 @@ class PPO:
         # compute value for the last step
         last_values_r = self.policy.evaluate(obs).detach()
         last_values_c = self.policy.evaluate_costs(obs).detach() if self.num_costs > 0 else None
-
+        last_values_fail = self.policy.evaluate_fail(obs).detach() if self.predict_failure_prob else None
         self.storage.compute_returns(
             last_values_r,
             self.gamma,
@@ -197,6 +213,9 @@ class PPO:
             last_values_c=last_values_c,
             gamma_cost=self.gamma_cost,
             lam_cost=self.lam_cost,
+            last_values_fail=last_values_fail,
+            gamma_cost_fail=self.gamma_cost_fail,
+            lam_cost_fail=self.lam_cost_fail,
         )
 
     def update(self):  # noqa: C901
@@ -235,6 +254,9 @@ class PPO:
             target_values_c_batch,
             advantages_c_batch,
             returns_c_batch,
+            target_values_fail_batch,
+            advantages_fail_batch,
+            returns_fail_batch,
         ) in generator:
 
             # number of augmentations per sample
@@ -277,7 +299,10 @@ class PPO:
                     target_values_c_batch = target_values_c_batch.repeat(num_aug, 1)
                     advantages_c_batch = advantages_c_batch.repeat(num_aug, 1)
                     returns_c_batch = returns_c_batch.repeat(num_aug, 1)
-
+                if self.predict_failure_prob:
+                    target_values_fail_batch = target_values_fail_batch.repeat(num_aug, 1)
+                    advantages_fail_batch = advantages_fail_batch.repeat(num_aug, 1)
+                    returns_fail_batch = returns_fail_batch.repeat(num_aug, 1)
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
@@ -286,6 +311,7 @@ class PPO:
             # -- critic
             value_r_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             value_c_batch = self.policy.evaluate_costs(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]) if self.num_costs else None
+            value_fail_batch = self.policy.evaluate_fail(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]) if self.predict_failure_prob else None
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -369,7 +395,20 @@ class PPO:
                     value_c_loss = (returns_c_batch - value_c_batch).pow(2).mean()
             else:
                 value_c_loss = torch.tensor(0.0, device=self.device)
-            value_loss = value_r_loss + value_c_loss
+            if self.predict_failure_prob:
+                if self.use_clipped_value_loss:
+                    value_fail_clipped = target_values_fail_batch + (value_fail_batch - target_values_fail_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_fail_losses = (value_fail_batch - returns_fail_batch).pow(2)
+                    value_fail_losses_clipped = (value_fail_clipped - returns_fail_batch).pow(2)
+                    value_fail_loss = torch.max(value_fail_losses, value_fail_losses_clipped).mean()
+                else:
+                    value_fail_loss = (returns_fail_batch - value_fail_batch).pow(2).mean()
+            else:
+                value_fail_loss = torch.tensor(0.0, device=self.device)
+
+            value_loss = value_r_loss + value_c_loss + value_fail_loss
             loss = surrogate_loss + self.kappa*policy_cost_loss+self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
@@ -445,6 +484,7 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_value_r_loss = value_r_loss.item()
             mean_value_c_loss = value_c_loss.item() if self.num_costs > 0 else 0.0
+            mean_value_fail_loss= value_fail_loss.item() if self.predict_failure_prob else 0.0
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             # -- RND loss
@@ -459,6 +499,7 @@ class PPO:
         mean_value_loss /= num_updates
         mean_value_r_loss /= num_updates
         mean_value_c_loss /= num_updates
+        mean_value_fail_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         # -- For RND
@@ -475,6 +516,7 @@ class PPO:
             "value_function": mean_value_loss,
             "value_function_r": mean_value_r_loss,
             "value_function_c": mean_value_c_loss,
+            "value_function_fail": mean_value_fail_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
