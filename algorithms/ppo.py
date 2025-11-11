@@ -192,9 +192,9 @@ class PPO:
             self.transition.costs = extras["costs"].to(self.device)
         # failure probability signals
         if self.predict_failure_prob:
-            if "fail" not in extras:
+            if "cost_fail" not in extras:
                 raise KeyError("PPO expects extras['fail'] when predict_failure_prob=True.")
-            self.transition.costs_fail = extras["fail"].to(self.device).view(-1, 1)
+            self.transition.costs_fail = extras["cost_fail"].to(self.device).view(-1, 1)
         # record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
