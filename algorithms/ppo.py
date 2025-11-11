@@ -222,6 +222,9 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_value_r_loss=0
+        mean_value_c_loss=0
+        mean_value_fail_loss=0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -482,9 +485,9 @@ class PPO:
 
             # Store the losses
             mean_value_loss += value_loss.item()
-            mean_value_r_loss = value_r_loss.item()
-            mean_value_c_loss = value_c_loss.item() if self.num_costs > 0 else 0.0
-            mean_value_fail_loss= value_fail_loss.item() if self.predict_failure_prob else 0.0
+            mean_value_r_loss += value_r_loss.item()
+            mean_value_c_loss += value_c_loss.item() if self.num_costs > 0 else 0.0
+            mean_value_fail_loss += value_fail_loss.item() if self.predict_failure_prob else 0.0
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
             # -- RND loss

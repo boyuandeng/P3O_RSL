@@ -72,7 +72,7 @@ class ActorCritic(nn.Module):
         self.critic_fail = None
         if self.predict_failure_prob:
             self.critic_fail = MLP(num_actor_obs, 1, critic_hidden_dims, activation)
-            print(f"Fail Critic MLP (using actor obs): {self.critic_fail}")
+        print(f"Fail Critic MLP (using actor obs): {self.critic_fail}")
         if critic_obs_normalization:
             self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
         else:
@@ -142,7 +142,7 @@ class ActorCritic(nn.Module):
     
     def evaluate_costs(self, obs, **kwargs):
         if self.num_costs == 0:
-            return self.evaluate(obs, **kwargs)[..., 1:1]
+            return None
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         return self.critic_c(obs)  # [B,m]
